@@ -1,5 +1,0 @@
-{
-  "name": "my-proxy",
-  "main": "netlify/functions/proxy.js",
-  "compatibility_date": "2025-09-27"
-}
