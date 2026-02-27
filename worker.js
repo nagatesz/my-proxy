@@ -1,8 +1,16 @@
 export default {
   async fetch(request) {
     const reqUrl = new URL(request.url);
-    const target = reqUrl.searchParams.get('url');
     const proxyOrigin = reqUrl.origin;
+
+    // Get the FULL target including any extra query params after &
+    // e.g. /?url=https://foo.com/path&otherParam=1 should fetch https://foo.com/path&otherParam=1
+    const rawSearch = reqUrl.search; // e.g. ?url=https%3A%2F%2F...&hasCsp=true&href=...
+    let target = null;
+    if (rawSearch.startsWith('?url=')) {
+      // Everything after ?url= is the target (including any & params that belong to the target)
+      target = decodeURIComponent(rawSearch.slice(5));
+    }
 
     // HOME UI
     if (!target) {
@@ -23,7 +31,7 @@ export default {
         "#frame{flex:1;border:none;width:100%;display:none}",
         "</style></head><body>",
         "<div class='bar'>",
-        "<input id='u' type='text' placeholder='e.g. google.com or wikipedia.org' autocomplete='off'/>",
+        "<input id='u' type='text' placeholder='e.g. google.com or crazygames.com' autocomplete='off'/>",
         "<button id='btn'>Go</button>",
         "</div>",
         "<div id='msg'>Enter a URL above and press Go</div>",
@@ -55,28 +63,23 @@ export default {
 
     const targetOrigin = parsedTarget.origin;
 
-    // Convert any URL to a proxied URL
+    // Convert any URL to a proxied URL - always use encodeURIComponent so & in URLs stay intact
     function proxify(u) {
       if (!u) return u;
       u = u.trim();
       if (!u) return u;
-      // Pass through special schemes
       if (u.startsWith("#") || u.startsWith("data:") || u.startsWith("blob:") || u.startsWith("mailto:") || u.startsWith("javascript:")) return u;
-      // Already proxied
       if (u.startsWith(proxyOrigin)) return u;
-      // Absolute http(s)
       if (u.startsWith("http://") || u.startsWith("https://")) {
         return proxyOrigin + "/?url=" + encodeURIComponent(u);
       }
-      // Protocol-relative
       if (u.startsWith("//")) {
         return proxyOrigin + "/?url=" + encodeURIComponent("https:" + u);
       }
-      // Root-relative
       if (u.startsWith("/")) {
         return proxyOrigin + "/?url=" + encodeURIComponent(targetOrigin + u);
       }
-      // Relative path
+      // relative path
       const base = target.includes("?")
         ? target.substring(0, target.lastIndexOf("/") + 1)
         : (target.endsWith("/") ? target : target.substring(0, target.lastIndexOf("/") + 1));
@@ -105,15 +108,13 @@ export default {
 
     const ct = res.headers.get("content-type") || "";
 
-    // --- CSS: rewrite url() and @import ---
+    // CSS
     if (ct.includes("text/css") || /\.css(\?|$)/i.test(target)) {
       let css = await res.text();
-      // rewrite url("...") and url(...)
       css = css.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, function(match, quote, u) {
         if (!u || u.startsWith("data:")) return match;
         return "url(" + quote + proxify(u) + quote + ")";
       });
-      // rewrite @import "..." and @import url(...)
       css = css.replace(/@import\s+['"]([^'"]+)['"]/gi, function(_, u) {
         return "@import \"" + proxify(u) + "\"";
       });
@@ -123,7 +124,7 @@ export default {
       });
     }
 
-    // --- JavaScript: rewrite string literal URLs ---
+    // JavaScript
     if (ct.includes("javascript") || /\.m?js(\?|$)/i.test(target)) {
       let js = await res.text();
       js = js.replace(/(['"])(https?:\/\/[^\'",\s\\]{5,})(['"])/g, function(_, q1, u, q2) {
@@ -136,7 +137,7 @@ export default {
       });
     }
 
-    // --- Non-HTML: pass through ---
+    // Non-HTML assets
     if (!ct.includes("text/html")) {
       return new Response(res.body, {
         status: res.status,
@@ -148,13 +149,25 @@ export default {
       });
     }
 
-    // --- HTML: use HTMLRewriter ---
-    // Build the runtime interception script (injected into every HTML page)
+    // HTML - HTMLRewriter + runtime script
     const runtimeScript =
       "<script>" +
       "(function(){" +
       "var PX='" + proxyOrigin + "/?url=';" +
       "var TO='" + targetOrigin + "';" +
+      // Spoof location so sites don't crash on hostname checks
+      "try{" +
+        "Object.defineProperty(window,'location',{" +
+          "get:function(){" +
+            "var loc=Object.create(location);" +
+            "Object.defineProperty(loc,'hostname',{get:function(){return '" + parsedTarget.hostname + "';}});" +
+            "Object.defineProperty(loc,'host',{get:function(){return '" + parsedTarget.host + "';}});" +
+            "Object.defineProperty(loc,'origin',{get:function(){return '" + targetOrigin + "';}});" +
+            "Object.defineProperty(loc,'href',{get:function(){return '" + target.replace("'","\'") + "';}});" +
+            "return loc;" +
+          "}" +
+        "});" +
+      "}catch(e){}" +
       "function w(u){" +
         "if(!u||typeof u!=='string')return u;" +
         "u=u.trim();" +
@@ -167,36 +180,24 @@ export default {
       "}" +
       "if(window.fetch){" +
         "var oF=window.fetch;" +
-        "window.fetch=function(input,init){" +
-          "return oF(typeof input==='string'?w(input):input,init);" +
-        "};" +
+        "window.fetch=function(input,init){return oF(typeof input==='string'?w(input):input,init);};" +
       "}" +
       "if(window.XMLHttpRequest){" +
         "var oX=XMLHttpRequest.prototype.open;" +
-        "XMLHttpRequest.prototype.open=function(method,url){" +
-          "return oX.apply(this,[method,w(url)].concat([].slice.call(arguments,2)));" +
-        "};" +
+        "XMLHttpRequest.prototype.open=function(method,url){return oX.apply(this,[method,w(url)].concat([].slice.call(arguments,2)));};" +
       "}" +
       "})();" +
       "<" + "/script>";
 
     const rewriter = new HTMLRewriter()
-      // Inject runtime script at top of <head>
-      .on("head", {
-        element(el) { el.prepend(runtimeScript, { html: true }); }
-      })
-      // Remove security headers
+      .on("head", { element(el) { el.prepend(runtimeScript, { html: true }); } })
       .on("meta[http-equiv]", {
         element(el) {
           const v = (el.getAttribute("http-equiv") || "").toLowerCase();
           if (v === "content-security-policy" || v === "x-frame-options") el.remove();
         }
       })
-      // Rewrite <a href>
-      .on("a[href]", {
-        element(el) { el.setAttribute("href", proxify(el.getAttribute("href"))); }
-      })
-      // Rewrite <link href> (stylesheets, icons, etc)
+      .on("a[href]", { element(el) { el.setAttribute("href", proxify(el.getAttribute("href"))); } })
       .on("link[href]", {
         element(el) {
           el.setAttribute("href", proxify(el.getAttribute("href")));
@@ -204,7 +205,6 @@ export default {
           el.removeAttribute("crossorigin");
         }
       })
-      // Rewrite <script src>
       .on("script[src]", {
         element(el) {
           el.setAttribute("src", proxify(el.getAttribute("src")));
@@ -212,59 +212,43 @@ export default {
           el.removeAttribute("crossorigin");
         }
       })
-      // Rewrite <img src> and <img srcset>
       .on("img", {
         element(el) {
           if (el.getAttribute("src")) el.setAttribute("src", proxify(el.getAttribute("src")));
           if (el.getAttribute("srcset")) {
             el.setAttribute("srcset",
-              el.getAttribute("srcset").replace(/(https?:\/\/[^\s,]+|^\/[^\s,]+|^\/\/[^\s,]+)/g,
-                function(u) { return proxify(u); }
-              )
+              el.getAttribute("srcset").replace(/(https?:\/\/[^\s,]+|\/\/[^\s,]+)/g, function(u) { return proxify(u); })
             );
           }
         }
       })
-      // Rewrite <source src/srcset>
       .on("source", {
         element(el) {
           if (el.getAttribute("src")) el.setAttribute("src", proxify(el.getAttribute("src")));
           if (el.getAttribute("srcset")) {
             el.setAttribute("srcset",
-              el.getAttribute("srcset").replace(/(https?:\/\/[^\s,]+)/g,
-                function(u) { return proxify(u); }
-              )
+              el.getAttribute("srcset").replace(/(https?:\/\/[^\s,]+)/g, function(u) { return proxify(u); })
             );
           }
         }
       })
-      // Rewrite <iframe src>
-      .on("iframe[src]", {
-        element(el) { el.setAttribute("src", proxify(el.getAttribute("src"))); }
-      })
-      // Rewrite <form action>
-      .on("form[action]", {
-        element(el) { el.setAttribute("action", proxify(el.getAttribute("action"))); }
-      })
-      // Rewrite <video src> and <audio src>
+      .on("iframe[src]", { element(el) { el.setAttribute("src", proxify(el.getAttribute("src"))); } })
+      .on("form[action]", { element(el) { if(el.getAttribute("action")) el.setAttribute("action", proxify(el.getAttribute("action"))); } })
       .on("video[src]", { element(el) { el.setAttribute("src", proxify(el.getAttribute("src"))); } })
       .on("audio[src]", { element(el) { el.setAttribute("src", proxify(el.getAttribute("src"))); } })
-      // Rewrite inline style url() values
       .on("[style]", {
         element(el) {
           const style = el.getAttribute("style");
           if (style && style.includes("url(")) {
-            const newStyle = style.replace(/url\((['"]?)(.*?)\1\)/gi, function(match, q, u) {
+            el.setAttribute("style", style.replace(/url\((['"]?)(.*?)\1\)/gi, function(match, q, u) {
               if (!u || u.startsWith("data:")) return match;
               return "url(" + q + proxify(u) + q + ")";
-            });
-            el.setAttribute("style", newStyle);
+            }));
           }
         }
       });
 
     const transformed = rewriter.transform(res);
-
     return new Response(transformed.body, {
       status: res.status,
       headers: {
