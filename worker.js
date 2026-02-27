@@ -4,7 +4,7 @@ export default {
     const target = url.searchParams.get('url');
 
     if (!target) {
-      return new Response(`<!DOCTYPE html>
+      const ui = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -24,36 +24,48 @@ body { font-family:Arial,sans-serif; background:#1a1a2e; color:#eee; display:fle
 </head>
 <body>
   <div class="bar">
-    <input id="u" type="text" placeholder="e.g. google.com or https://wikipedia.org" autocomplete="off" spellcheck="false"/>
+    <input id="u" type="text" placeholder="e.g. google.com or youtube.com" autocomplete="off" spellcheck="false"/>
     <button id="btn">Go</button>
   </div>
   <div id="msg">Enter a URL above and press Go</div>
   <iframe id="frame"></iframe>
   <script>
-    function navigate() {
-      var val = document.getElementById('u').value.trim();
-      if (!val) return;
-      if (!/^https?:\/\//i.test(val)) val = 'https://' + val;
-      document.getElementById('u').value = val;
-      document.getElementById('msg').style.display = 'none';
-      document.getElementById('frame').style.display = 'block';
-      document.getElementById('frame').src = '/?url=' + encodeURIComponent(val);
-    }
-    document.getElementById('btn').addEventListener('click', navigate);
-    document.getElementById('u').addEventListener('keydown', function(e) {
-      if (e.key === 'Enter') navigate();
-    });
-  </script>
+(function() {
+  function navigate() {
+    var val = document.getElementById('u').value.trim();
+    if (!val) return;
+    if (val.indexOf('http') !== 0) val = 'https://' + val;
+    document.getElementById('u').value = val;
+    document.getElementById('msg').style.display = 'none';
+    document.getElementById('frame').style.display = 'block';
+    document.getElementById('frame').src = '/?url=' + encodeURIComponent(val);
+  }
+  document.getElementById('btn').addEventListener('click', navigate);
+  document.getElementById('u').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') navigate();
+  });
+})();
+` + '<' + `/script>
 </body>
-</html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+</html>`;
+      return new Response(ui, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
     let parsedTarget;
     try { parsedTarget = new URL(target); }
-    catch(e) { return new Response('Invalid URL', { status: 400 }); }
+    catch(e) { return new Response('Invalid URL: ' + target, { status: 400 }); }
 
     const targetOrigin = parsedTarget.origin;
     const proxyOrigin = new URL(request.url).origin;
+
+    function rewriteUrl(u) {
+      if (!u) return u;
+      u = u.trim();
+      if (u.indexOf('http') === 0 && u.indexOf(proxyOrigin) < 0) return proxyOrigin + '/?url=' + encodeURIComponent(u);
+      if (u.indexOf('//') === 0) return proxyOrigin + '/?url=' + encodeURIComponent('https:' + u);
+      if (u.indexOf('/') === 0) return proxyOrigin + '/?url=' + encodeURIComponent(targetOrigin + u);
+      return u;
+    }
 
     let res;
     try {
@@ -74,9 +86,11 @@ body { font-family:Arial,sans-serif; background:#1a1a2e; color:#eee; display:fle
 
     const ct = res.headers.get('content-type') || '';
 
-    if (ct.includes('javascript') || /\.m?js(\?|$)/i.test(target)) {
+    // JS files: rewrite absolute URLs inside them
+    if (ct.includes('javascript') || target.match(/\.m?js(\?|$)/i)) {
       let js = await res.text();
       js = js.replace(/(["'`])(https?:\/\/[^"'`\s\\]{4,})(["'`])/g, function(_, q1, u, q2) {
+        if (u.indexOf(proxyOrigin) >= 0) return q1 + u + q2;
         return q1 + proxyOrigin + '/?url=' + encodeURIComponent(u) + q2;
       });
       return new Response(js, {
@@ -85,23 +99,20 @@ body { font-family:Arial,sans-serif; background:#1a1a2e; color:#eee; display:fle
       });
     }
 
+    // All other non-HTML: pass through
     if (!ct.includes('text/html')) {
       return new Response(res.body, {
         status: res.status,
-        headers: { 'Content-Type': ct || 'application/octet-stream', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'public, max-age=3600' }
+        headers: {
+          'Content-Type': ct || 'application/octet-stream',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=3600',
+        }
       });
     }
 
+    // HTML: rewrite
     let html = await res.text();
-
-    function rewriteUrl(u) {
-      if (!u) return u;
-      u = u.trim();
-      if (/^https?:\/\//i.test(u)) return proxyOrigin + '/?url=' + encodeURIComponent(u);
-      if (/^\/\//.test(u)) return proxyOrigin + '/?url=' + encodeURIComponent('https:' + u);
-      if (/^\//.test(u)) return proxyOrigin + '/?url=' + encodeURIComponent(targetOrigin + u);
-      return u;
-    }
 
     html = html
       .replace(/\s+integrity="[^"]*"/gi, '')
@@ -118,24 +129,35 @@ body { font-family:Arial,sans-serif; background:#1a1a2e; color:#eee; display:fle
         return 'srcset="' + val.replace(/(https?:\/\/[^\s,]+)/g, function(u) {
           return proxyOrigin + '/?url=' + encodeURIComponent(u);
         }) + '"';
-      })
-      .replace(/(<head[^>]*>)/i, '$1\n<base href="' + targetOrigin + '/">');
+      });
 
-    var script = '<script>(function(){' +
+    // Add base tag
+    if (html.match(/<head[^>]*>/i)) {
+      html = html.replace(/(<head[^>]*>)/i, '$1\n<base href="' + targetOrigin + '/">');
+    }
+
+    // Build injected script using string concat to avoid any escaping issues
+    var injectJs = '(function(){' +
       'var PX="' + proxyOrigin + '/?url=";' +
       'var TO="' + targetOrigin + '";' +
       'function w(u){' +
         'if(!u||typeof u!=="string")return u;' +
-        'if(/^https?:\\/\\//i.test(u)&&u.indexOf("' + proxyOrigin + '")<0)return PX+encodeURIComponent(u);' +
-        'if(/^\\/\\//.test(u))return PX+encodeURIComponent("https:"+u);' +
-        'if(/^\\/[^/]/.test(u))return PX+encodeURIComponent(TO+u);' +
+        'if(u.indexOf("http")===0&&u.indexOf("' + proxyOrigin + '")<0)return PX+encodeURIComponent(u);' +
+        'if(u.indexOf("//")===0)return PX+encodeURIComponent("https:"+u);' +
+        'if(u.indexOf("/")===0&&u.indexOf("/?")<0)return PX+encodeURIComponent(TO+u);' +
         'return u;' +
       '}' +
-      'var oF=window.fetch;window.fetch=function(i,x){return oF(typeof i==="string"?w(i):i,x);};' +
-      'var oX=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){return oX.apply(this,[m,w(u)].concat([].slice.call(arguments,2)));};' +
-    '})();<\/script>';
+      'if(window.fetch){var oF=window.fetch;window.fetch=function(i,x){return oF(typeof i==="string"?w(i):i,x);};}\n' +
+      'if(window.XMLHttpRequest){var oX=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){return oX.apply(this,[m,w(u)].concat([].slice.call(arguments,2)));};}\n' +
+    '})();';
 
-    html = html.includes('</head>') ? html.replace('</head>', script + '</head>') : script + html;
+    var injectedTag = '<' + 'script>' + injectJs + '<' + '/script>';
+
+    if (html.includes('</head>')) {
+      html = html.replace('</head>', injectedTag + '</head>');
+    } else {
+      html = injectedTag + html;
+    }
 
     return new Response(html, {
       status: res.status,
