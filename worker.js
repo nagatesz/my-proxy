@@ -3,158 +3,186 @@ export default {
     const url = new URL(request.url);
     const target = url.searchParams.get('url');
 
+    // ── Home UI ──
     if (!target) {
       return new Response(`<!DOCTYPE html>
-<html>
-<head><title>Proxy</title>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Proxy</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:#1a1a2e; color:#eee; font-family:Arial,sans-serif; display:flex; flex-direction:column; height:100vh; }
-  .bar { display:flex; gap:8px; padding:10px; background:#16213e; align-items:center; }
-  input { flex:1; padding:8px 14px; border-radius:20px; border:none; background:#0f3460; color:#fff; font-size:15px; outline:none; }
-  button { padding:8px 20px; border-radius:20px; border:none; background:#e94560; color:#fff; font-size:15px; cursor:pointer; }
-  button:hover { background:#c73652; }
-  iframe { flex:1; border:none; background:#fff; }
-  .msg { display:flex; align-items:center; justify-content:center; flex:1; font-size:18px; color:#888; }
+  html, body { height:100%; }
+  body { font-family:Arial,sans-serif; background:#1a1a2e; color:#eee; display:flex; flex-direction:column; }
+  .bar { display:flex; gap:8px; padding:10px 14px; background:#16213e; align-items:center; flex-shrink:0; }
+  .bar input {
+    flex:1; padding:9px 16px; border-radius:24px; border:none;
+    background:#0f3460; color:#fff; font-size:15px; outline:none;
+  }
+  .bar button {
+    padding:9px 22px; border-radius:24px; border:none;
+    background:#e94560; color:#fff; font-size:15px; cursor:pointer; white-space:nowrap;
+  }
+  .bar button:hover { background:#c73652; }
+  #msg { flex:1; display:flex; align-items:center; justify-content:center; font-size:18px; color:#555; }
+  #frame { flex:1; border:none; width:100%; display:none; }
 </style>
 </head>
 <body>
   <div class="bar">
-    <input id="url" type="text" placeholder="e.g. youtube.com or google.com" />
-    <button onclick="load()">Go</button>
+    <input id="urlInput" type="text" placeholder="e.g. google.com or https://wikipedia.org" autocomplete="off" spellcheck="false"/>
+    <button id="goBtn">Go</button>
   </div>
-  <div class="msg" id="msg">Enter any URL above and press Go</div>
-  <iframe id="frame" style="display:none" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+  <div id="msg">Enter a URL above and press Go</div>
+  <iframe id="frame" id="frame"></iframe>
   <script>
-    document.getElementById('url').addEventListener('keydown', e => { if(e.key==='Enter') load(); });
-    function load() {
-      let u = document.getElementById('url').value.trim();
-      if (!u) return;
-      // Auto add https:// if missing
-      if (!u.match(/^https?:\/\//i)) u = 'https://' + u;
-      document.getElementById('url').value = u;
-      document.getElementById('msg').style.display = 'none';
-      document.getElementById('frame').style.display = 'block';
-      document.getElementById('frame').src = '/?url=' + encodeURIComponent(u);
+    var input = document.getElementById('urlInput');
+    var frame = document.getElementById('frame');
+    var msg   = document.getElementById('msg');
+
+    function go() {
+      var raw = input.value.trim();
+      if (!raw) return;
+      if (!/^https?:\/\//i.test(raw)) raw = 'https://' + raw;
+      input.value = raw;
+      msg.style.display = 'none';
+      frame.style.display = 'block';
+      frame.src = '/?url=' + encodeURIComponent(raw);
     }
+
+    document.getElementById('goBtn').addEventListener('click', go);
+    input.addEventListener('keydown', function(e) { if (e.key === 'Enter') go(); });
   </script>
 </body>
-</html>`, { headers: { 'Content-Type': 'text/html' } });
+</html>`, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+      });
     }
 
+    // ── Proxy request ──
+    let parsedTarget;
     try {
-      const parsedTarget = new URL(target);
-      const origin = parsedTarget.origin;
-      const proxyBase = new URL(request.url).origin;
+      parsedTarget = new URL(target);
+    } catch(e) {
+      return new Response('Invalid URL: ' + target, { status: 400 });
+    }
 
-      const res = await fetch(target, {
-        method: request.method,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-          'Accept': '*/*',
-          'Accept-Language': 'en-US,en;q=0.5',
-          'Accept-Encoding': 'identity',
-          'Referer': origin,
-          'Origin': origin,
-        },
+    const targetOrigin = parsedTarget.origin;
+    const proxyOrigin  = new URL(request.url).origin;
+
+    let res;
+    try {
+      res = await fetch(target, {
         redirect: 'follow',
+        headers: {
+          'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
+          'Referer':         targetOrigin + '/',
+        },
       });
+    } catch(e) {
+      return new Response(`<html><body style="background:#1a1a2e;color:#e94560;font-family:Arial;padding:40px;text-align:center;">
+        <h2>Failed to fetch</h2><p>${e.message}</p>
+        <a href="/" style="color:#aaa">← Back</a>
+      </body></html>`, { status: 502, headers: { 'Content-Type': 'text/html' } });
+    }
 
-      const contentType = res.headers.get('content-type') || '';
+    const ct = res.headers.get('content-type') || '';
 
-      // ── JavaScript: rewrite URLs inside JS files ──
-      if (contentType.includes('javascript') || target.match(/\.m?js(\?|$)/i)) {
-        let js = await res.text();
-        // Rewrite fetch/XHR calls to absolute URLs inside JS
-        js = js.replace(/(["'`])(https?:\/\/[^"'`\s]+)(["'`])/g, (_, q1, u, q2) =>
-          `${q1}${proxyBase}/?url=${encodeURIComponent(u)}${q2}`);
-        return new Response(js, {
-          status: res.status,
-          headers: {
-            'Content-Type': contentType || 'application/javascript',
-            'Access-Control-Allow-Origin': '*',
-          },
-        });
-      }
+    // Pass JS through but rewrite absolute URLs inside it
+    if (ct.includes('javascript') || /\.m?js(\?|$)/i.test(target)) {
+      let js = await res.text();
+      js = js.replace(/(["'`])(https?:\/\/[^"'`\s\\]{4,})(["'`])/g, function(_, q1, u, q2) {
+        return q1 + proxyOrigin + '/?url=' + encodeURIComponent(u) + q2;
+      });
+      return new Response(js, {
+        status: res.status,
+        headers: {
+          'Content-Type': 'application/javascript',
+          'Access-Control-Allow-Origin': '*',
+        }
+      });
+    }
 
-      // ── Non-HTML assets: pass through directly ──
-      if (!contentType.includes('text/html')) {
-        return new Response(res.body, {
-          status: res.status,
-          headers: {
-            'Content-Type': contentType,
-            'Access-Control-Allow-Origin': '*',
-            'Cache-Control': 'public, max-age=3600',
-          },
-        });
-      }
+    // Pass CSS + all other non-HTML assets straight through
+    if (!ct.includes('text/html')) {
+      return new Response(res.body, {
+        status: res.status,
+        headers: {
+          'Content-Type': ct || 'application/octet-stream',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=3600',
+        }
+      });
+    }
 
-      // ── HTML: rewrite and inject interception script ──
-      let body = await res.text();
+    // ── HTML rewriting ──
+    let html = await res.text();
 
-      body = body
-        // Strip SRI integrity checks
-        .replace(/\s+integrity="[^"]*"/gi, '')
-        .replace(/\s+integrity='[^']*'/gi, '')
-        // Strip crossorigin
-        .replace(/\s+crossorigin(="[^"]*")?/gi, '')
-        // Strip CSP and X-Frame meta tags
-        .replace(/<meta[^>]*(content-security-policy|x-frame-options)[^>]*>/gi, '')
-        // Rewrite absolute URLs
-        .replace(/(href|src|action|data-src|data-href)="(https?:\/\/[^"]+)"/gi, (_, a, u) =>
-          `${a}="/?url=${encodeURIComponent(u)}"`)
-        // Rewrite protocol-relative URLs
-        .replace(/(href|src|action|data-src)="(\/\/[^"]+)"/gi, (_, a, u) =>
-          `${a}="/?url=${encodeURIComponent('https:' + u)}"`)
-        // Rewrite root-relative URLs
-        .replace(/(href|src|action|data-src)="(\/[^"]*?)"/gi, (_, a, p) =>
-          `${a}="/?url=${encodeURIComponent(origin + p)}"`)
-        // Rewrite srcset
-        .replace(/srcset="([^"]+)"/gi, (_, srcset) =>
-          `srcset="${srcset.replace(/(https?:\/\/[^\s,]+)/g, u => `/?url=${encodeURIComponent(u)}`)}"`)
-        // Add <base> tag so relative URLs resolve to proxy
-        .replace(/<head([^>]*)>/i, `<head$1><base href="/?url=${encodeURIComponent(origin)}/">`);
+    // Helper to rewrite a URL to go through proxy
+    function p(u) {
+      return proxyOrigin + '/?url=' + encodeURIComponent(u);
+    }
+    function pAbs(u) {
+      if (!u) return u;
+      if (/^https?:\/\//i.test(u)) return p(u);
+      if (/^\/\//.test(u))          return p('https:' + u);
+      if (/^\//.test(u))            return p(targetOrigin + u);
+      return u; // relative — leave for <base> to handle
+    }
 
-      // Inject fetch + XHR + pushState interceptor
-      const injected = `<script>
-(function() {
-  const PROXY = '${proxyBase}/?url=';
-  const ORIGIN = '${proxyBase}';
-  function wrap(u) {
-    if (!u || typeof u !== 'string') return u;
-    if (u.startsWith('/') && !u.startsWith('//')) return PROXY + encodeURIComponent('${origin}' + u);
-    if (u.startsWith('//')) return PROXY + encodeURIComponent('https:' + u);
-    if (u.startsWith('http') && !u.startsWith(ORIGIN)) return PROXY + encodeURIComponent(u);
+    html = html
+      // Kill SRI so scripts/styles aren't blocked after URL rewrite
+      .replace(/\s+integrity="[^"]*"/gi, '')
+      .replace(/\s+integrity='[^']*'/gi, '')
+      // Kill crossorigin
+      .replace(/\s+crossorigin(="[^"]*"|='[^']*')?/gi, '')
+      // Kill CSP / X-Frame meta tags
+      .replace(/<meta[^>]+(content-security-policy|x-frame-options)[^>]*\/?>/gi, '')
+      // Rewrite src="..." href="..." action="..."
+      .replace(/(\bsrc|\bhref|\baction|\bdata-src|\bdata-href)(\s*=\s*)(["'])(.*?)\3/gi, function(_, attr, eq, q, val) {
+        return attr + eq + q + pAbs(val.trim()) + q;
+      })
+      // Rewrite srcset
+      .replace(/\bsrcset(\s*=\s*)(["'])(.*?)\2/gi, function(_, eq, q, val) {
+        var rewritten = val.replace(/(https?:\/\/[^\s,]+)/g, function(u) { return p(u); });
+        return 'srcset' + eq + q + rewritten + q;
+      })
+      // Add <base> so any remaining relative URLs resolve correctly
+      .replace(/(<head[^>]*>)/i, '$1\n  <base href="' + targetOrigin + '/">');
+
+    // Interception script injected before </head>
+    var injected = `<script>
+(function(){
+  var PX = ${JSON.stringify(proxyOrigin + '/?url=')};
+  var TO = ${JSON.stringify(targetOrigin)};
+  function w(u){
+    if(!u||typeof u!=='string') return u;
+    if(/^https?:\\/\\//i.test(u) && u.indexOf(${JSON.stringify(proxyOrigin)})<0) return PX+encodeURIComponent(u);
+    if(/^\\/\\//.test(u)) return PX+encodeURIComponent('https:'+u);
+    if(/^\\//.test(u)) return PX+encodeURIComponent(TO+u);
     return u;
   }
-  // Intercept fetch
-  const _fetch = window.fetch;
-  window.fetch = (input, init) => _fetch(typeof input === 'string' ? wrap(input) : input, init);
-  // Intercept XHR
-  const _open = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(m, u, ...r) { return _open.call(this, m, wrap(u), ...r); };
-  // Intercept window.open
-  const _open2 = window.open;
-  window.open = (u, ...r) => _open2(wrap(u), ...r);
+  var oFetch=window.fetch;
+  window.fetch=function(input,init){return oFetch(typeof input==='string'?w(input):input,init);};
+  var oOpen=XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open=function(m,u){return oOpen.apply(this,[m,w(u)].concat(Array.prototype.slice.call(arguments,2)));};
+  var oWinOpen=window.open;
+  window.open=function(u){return oWinOpen(w(u));};
 })();
 <\/script>`;
 
-      body = body.includes('</head>') ? body.replace('</head>', injected + '</head>') : injected + body;
+    html = html.includes('</head>') ? html.replace('</head>', injected + '</head>') : injected + html;
 
-      return new Response(body, {
-        status: res.status,
-        headers: {
-          'Content-Type': 'text/html',
-          'X-Frame-Options': 'ALLOWALL',
-          'Access-Control-Allow-Origin': '*',
-        },
-      });
-
-    } catch (e) {
-      return new Response(`<html><body style="background:#1a1a2e;color:#e94560;font-family:Arial;padding:40px;text-align:center;">
-        <h2>Could not load page</h2><p>${e.message}</p>
-        <a href="/" style="color:#eee;display:block;margin-top:20px;">← Go back</a>
-      </body></html>`, { status: 500, headers: { 'Content-Type': 'text/html' } });
-    }
+    return new Response(html, {
+      status: res.status,
+      headers: {
+        'Content-Type':            'text/html; charset=utf-8',
+        'X-Frame-Options':         'ALLOWALL',
+        'Access-Control-Allow-Origin': '*',
+      }
+    });
   }
 };
