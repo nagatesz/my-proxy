@@ -61,9 +61,16 @@ body { font-family:Arial,sans-serif; background:#1a1a2e; color:#eee; display:fle
     function rewriteUrl(u) {
       if (!u) return u;
       u = u.trim();
+      // Skip empty, anchors, data URIs, mailto, javascript
+      if (!u || u.indexOf('#') === 0 || u.indexOf('data:') === 0 || u.indexOf('mailto:') === 0 || u.indexOf('javascript:') === 0) return u;
       if (u.indexOf('http') === 0 && u.indexOf(proxyOrigin) < 0) return proxyOrigin + '/?url=' + encodeURIComponent(u);
       if (u.indexOf('//') === 0) return proxyOrigin + '/?url=' + encodeURIComponent('https:' + u);
       if (u.indexOf('/') === 0) return proxyOrigin + '/?url=' + encodeURIComponent(targetOrigin + u);
+      // relative URL - make it absolute through proxy
+      if (u.indexOf('http') !== 0 && u.indexOf('/') !== 0 && u.indexOf('.') === 0) {
+        var base = target.substring(0, target.lastIndexOf('/') + 1);
+        return proxyOrigin + '/?url=' + encodeURIComponent(base + u);
+      }
       return u;
     }
 
@@ -85,6 +92,21 @@ body { font-family:Arial,sans-serif; background:#1a1a2e; color:#eee; display:fle
     }
 
     const ct = res.headers.get('content-type') || '';
+
+    // CSS: pass through but rewrite any url() references inside it
+    if (ct.includes('text/css') || target.match(/\.css(\?|$)/i)) {
+      let css = await res.text();
+      css = css.replace(/url\((['"]?)(https?:\/\/[^'")]+)(['"]?)\)/gi, function(_, q1, u, q2) {
+        return 'url(' + q1 + proxyOrigin + '/?url=' + encodeURIComponent(u) + q2 + ')';
+      });
+      css = css.replace(/url\((['"]?)(\/[^'")]+)(['"]?)\)/gi, function(_, q1, u, q2) {
+        return 'url(' + q1 + proxyOrigin + '/?url=' + encodeURIComponent(targetOrigin + u) + q2 + ')';
+      });
+      return new Response(css, {
+        status: res.status,
+        headers: { 'Content-Type': 'text/css', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
 
     // JS files: rewrite absolute URLs inside them
     if (ct.includes('javascript') || target.match(/\.m?js(\?|$)/i)) {
@@ -119,36 +141,42 @@ body { font-family:Arial,sans-serif; background:#1a1a2e; color:#eee; display:fle
       .replace(/\s+integrity='[^']*'/gi, '')
       .replace(/\s+crossorigin(="[^"]*"|='[^']*')?/gi, '')
       .replace(/<meta[^>]+(content-security-policy|x-frame-options)[^>]*\/?>/gi, '')
+      // Rewrite src/href/action with double quotes
       .replace(/\b(src|href|action|data-src|data-href)\s*=\s*"([^"]*)"/gi, function(_, attr, val) {
         return attr + '="' + rewriteUrl(val) + '"';
       })
+      // Rewrite src/href/action with single quotes
       .replace(/\b(src|href|action|data-src|data-href)\s*=\s*'([^']*)'/gi, function(_, attr, val) {
         return attr + "='" + rewriteUrl(val) + "'";
       })
+      // Rewrite srcset
       .replace(/srcset\s*=\s*"([^"]*)"/gi, function(_, val) {
         return 'srcset="' + val.replace(/(https?:\/\/[^\s,]+)/g, function(u) {
           return proxyOrigin + '/?url=' + encodeURIComponent(u);
         }) + '"';
+      })
+      // Rewrite CSS url() inside style tags and style attributes
+      .replace(/url\((['"]?)(\/[^'")]+)(['"]?)\)/gi, function(_, q1, u, q2) {
+        return 'url(' + q1 + proxyOrigin + '/?url=' + encodeURIComponent(targetOrigin + u) + q2 + ')';
+      })
+      .replace(/url\((['"]?)(https?:\/\/[^'")]+)(['"]?)\)/gi, function(_, q1, u, q2) {
+        return 'url(' + q1 + proxyOrigin + '/?url=' + encodeURIComponent(u) + q2 + ')';
       });
 
-    // Add base tag
-    if (html.match(/<head[^>]*>/i)) {
-      html = html.replace(/(<head[^>]*>)/i, '$1\n<base href="' + targetOrigin + '/">');
-    }
-
-    // Build injected script using string concat to avoid any escaping issues
+    // Build injected script
     var injectJs = '(function(){' +
       'var PX="' + proxyOrigin + '/?url=";' +
       'var TO="' + targetOrigin + '";' +
       'function w(u){' +
         'if(!u||typeof u!=="string")return u;' +
+        'if(u.indexOf("#")===0||u.indexOf("data:")===0||u.indexOf("blob:")===0)return u;' +
         'if(u.indexOf("http")===0&&u.indexOf("' + proxyOrigin + '")<0)return PX+encodeURIComponent(u);' +
         'if(u.indexOf("//")===0)return PX+encodeURIComponent("https:"+u);' +
         'if(u.indexOf("/")===0&&u.indexOf("/?")<0)return PX+encodeURIComponent(TO+u);' +
         'return u;' +
       '}' +
-      'if(window.fetch){var oF=window.fetch;window.fetch=function(i,x){return oF(typeof i==="string"?w(i):i,x);};}\n' +
-      'if(window.XMLHttpRequest){var oX=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){return oX.apply(this,[m,w(u)].concat([].slice.call(arguments,2)));};}\n' +
+      'if(window.fetch){var oF=window.fetch;window.fetch=function(i,x){return oF(typeof i==="string"?w(i):i,x);};}' +
+      'if(window.XMLHttpRequest){var oX=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){return oX.apply(this,[m,w(u)].concat([].slice.call(arguments,2)));};}'  +
     '})();';
 
     var injectedTag = '<' + 'script>' + injectJs + '<' + '/script>';
